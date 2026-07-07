@@ -8,7 +8,9 @@ import pytest
 
 from flash_mla import (
     get_mla_metadata,
-    flash_mla_with_kvcache
+    flash_mla_with_kvcache,
+    debug_qk_32x32_8waves,
+    debug_qk_softmax_32x32_8waves,
 )
 
 
@@ -39,6 +41,48 @@ def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str) -> None:
     amax_diff = (x - y).abs().max().item()
     # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     assert cos_diff < 1e-5
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_debug_qk_32x32_8waves(dtype):
+    device = torch.device("cuda:0")
+    torch.set_default_device(device)
+    torch.manual_seed(0)
+
+    b, s_q, h_q, h_kv, d = 1, 32, 1, 1, 576
+    block_size = 32
+    q = torch.randn(b, s_q, h_q, d, device=device, dtype=dtype)
+    k_cache = torch.randn(1, block_size, h_kv, d, device=device, dtype=dtype)
+    cache_seqlens = torch.full((b,), block_size, device=device, dtype=torch.int32)
+    block_table = torch.zeros((b, 1), device=device, dtype=torch.int32)
+
+    qk = debug_qk_32x32_8waves(q, k_cache, cache_seqlens, block_table)
+    ref = q[0, :, 0].float() @ k_cache[0, :, 0].float().transpose(0, 1)
+
+    torch.testing.assert_close(qk[0, 0], ref, rtol=2e-2, atol=2e-1)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_debug_qk_softmax_32x32_8waves(dtype):
+    device = torch.device("cuda:0")
+    torch.set_default_device(device)
+    torch.manual_seed(0)
+
+    b, s_q, h_q, h_kv, d = 1, 32, 1, 1, 576
+    block_size = 32
+    q = torch.randn(b, s_q, h_q, d, device=device, dtype=dtype)
+    k_cache = torch.randn(1, block_size, h_kv, d, device=device, dtype=dtype)
+    cache_seqlens = torch.full((b,), block_size, device=device, dtype=torch.int32)
+    block_table = torch.zeros((b, 1), device=device, dtype=torch.int32)
+    softmax_scale = d ** (-0.5)
+
+    p = debug_qk_softmax_32x32_8waves(q, k_cache, cache_seqlens, block_table, softmax_scale)
+    qk_ref = q[0, :, 0].float() @ k_cache[0, :, 0].float().transpose(0, 1)
+    ref = torch.softmax(qk_ref * softmax_scale, dim=-1, dtype=torch.float32)
+
+    torch.testing.assert_close(p[0, 0], ref, rtol=2e-2, atol=2e-2)
 
 
 @torch.inference_mode()

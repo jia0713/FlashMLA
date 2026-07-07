@@ -323,6 +323,7 @@ if not SKIP_CUDA_BUILD:
     src_file = [
         "csrc/flash_api/flash_api.cpp",
         "csrc/flash_run/run_mla_fwd.cpp",
+        "csrc/flash_api/flash_qk_debug_32x32_8waves.cu",
         "csrc/instantiations/flash_fwd_mla_metadata.cu",
         "csrc/utils/print_parameter.cpp",
         "csrc/utils/process_str.cpp",

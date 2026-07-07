@@ -17,6 +17,9 @@
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+void run_qk_debug_32x32_8waves(mcFlashAttn::Flash_fwd_mla_params &params, float *out, cudaStream_t stream);
+void run_qk_softmax_debug_32x32_8waves(mcFlashAttn::Flash_fwd_mla_params &params, float *out, cudaStream_t stream);
+
 inline int int64_stride_to_int(int64_t orig_stride) {
     if (orig_stride > std::numeric_limits<int>::max()) {
         TORCH_CHECK(false, "[Sparse TopK Attention] Stride exceeds int32 limit: ", orig_stride);
@@ -418,9 +421,115 @@ get_mla_decoding_metadata(
     return {tile_scheduler_metadata, num_splits};
 }
 
+at::Tensor
+debug_qk_32x32_8waves_impl(
+    at::Tensor &q,
+    const at::Tensor &kcache,
+    const at::Tensor &seqlens_k,
+    const at::Tensor &block_table,
+    bool do_softmax,
+    double softmax_scale
+) {
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kBFloat16 || q_dtype == torch::kFloat16);
+    TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
+    CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(seqlens_k); CHECK_DEVICE(block_table);
+    TORCH_CHECK(q.stride(-1) == 1, "q must have contiguous last dimension");
+    TORCH_CHECK(kcache.stride(-1) == 1, "kcache must have contiguous last dimension");
+    CHECK_CONTIGUOUS(seqlens_k);
+    TORCH_CHECK(seqlens_k.dtype() == torch::kInt32);
+    TORCH_CHECK(block_table.dtype() == torch::kInt32);
+    TORCH_CHECK(block_table.stride(-1) == 1);
+
+    const auto sizes = q.sizes();
+    const int batch_size = sizes[0];
+    const int seqlen_q_ori = sizes[1];
+    const int num_heads_ori = sizes[2];
+    const int head_size = sizes[3];
+    const int num_heads_k = kcache.size(2);
+    const int page_block_size = kcache.size(1);
+    TORCH_CHECK(head_size == 576, "debug QK path only supports head_dim=576");
+    TORCH_CHECK(num_heads_ori % num_heads_k == 0);
+    TORCH_CHECK(page_block_size == 32, "debug QK path currently requires page_block_size=32");
+
+    const int ngroups = num_heads_ori / num_heads_k;
+    const int seqlen_q = seqlen_q_ori * ngroups;
+    TORCH_CHECK(seqlen_q == 32, "debug QK path currently requires seqlen_q * ngroups == 32");
+    TORCH_CHECK(seqlens_k.min().cpu().item<int>() >= 32, "debug QK path requires every K sequence to have at least 32 tokens");
+
+    q = q.view({batch_size, seqlen_q_ori, num_heads_k, ngroups, head_size}).transpose(2, 3)
+            .reshape({batch_size, seqlen_q, num_heads_k, head_size});
+    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads_k, head_size);
+
+    const int max_num_blocks_per_seq = block_table.size(1);
+    const int num_blocks = kcache.size(0);
+    CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size);
+    CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
+
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::Tensor out = torch::empty({batch_size, num_heads_k, 32, 32}, q.options().dtype(torch::kFloat32));
+
+    mcFlashAttn::Flash_fwd_mla_params params = {};
+    params.b = batch_size;
+    params.seqlen_q = seqlen_q;
+    params.seqlen_k = seqlens_k.max().cpu().item<int>();
+    params.cu_seqlens_k = const_cast<int *>(seqlens_k.data_ptr<int>());
+    params.is_seqlens_k_cumulative = false;
+    params.h = num_heads_k;
+    params.h_h_k_ratio = 1;
+    params.ngroups = ngroups;
+    params.d = head_size;
+    params.d_v = 512;
+    params.q_ptr = q.data_ptr();
+    params.k_ptr = const_cast<void *>(kcache.data_ptr());
+    params.q_batch_stride = q.stride(0);
+    params.k_batch_stride = kcache.stride(0);
+    params.q_row_stride = q.stride(-3);
+    params.k_row_stride = kcache.stride(-3);
+    params.q_head_stride = q.stride(-2);
+    params.k_head_stride = kcache.stride(-2);
+    params.block_table = const_cast<int *>(block_table.data_ptr<int>());
+    params.block_table_batch_stride = block_table.stride(0);
+    params.page_block_size = page_block_size;
+    params.is_bf16 = q_dtype == torch::kBFloat16;
+    params.scale_softmax = static_cast<float>(softmax_scale);
+    params.scale_softmax_log2 = static_cast<float>(softmax_scale * M_LOG2E);
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    if (do_softmax) {
+        run_qk_softmax_debug_32x32_8waves(params, out.data_ptr<float>(), stream);
+    } else {
+        run_qk_debug_32x32_8waves(params, out.data_ptr<float>(), stream);
+    }
+    return out;
+}
+
+at::Tensor
+debug_qk_32x32_8waves(
+    at::Tensor &q,
+    const at::Tensor &kcache,
+    const at::Tensor &seqlens_k,
+    const at::Tensor &block_table
+) {
+    return debug_qk_32x32_8waves_impl(q, kcache, seqlens_k, block_table, false, 1.0);
+}
+
+at::Tensor
+debug_qk_softmax_32x32_8waves(
+    at::Tensor &q,
+    const at::Tensor &kcache,
+    const at::Tensor &seqlens_k,
+    const at::Tensor &block_table,
+    double softmax_scale
+) {
+    return debug_qk_32x32_8waves_impl(q, kcache, seqlens_k, block_table, true, softmax_scale);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
     m.def("get_mla_metadata", &get_mla_decoding_metadata);
     m.def("fwd_kvcache_mla", &fwd_kvcache_mla);
     m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
+    m.def("debug_qk_32x32_8waves", &debug_qk_32x32_8waves);
+    m.def("debug_qk_softmax_32x32_8waves", &debug_qk_softmax_32x32_8waves);
 }

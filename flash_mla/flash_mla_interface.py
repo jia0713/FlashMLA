@@ -249,3 +249,34 @@ def flash_mla_sparse_fwd(
         q, kv, indices, sm_scale, d_v, indices_all_valid_per_q
     )
     return results
+
+
+def debug_qk_32x32_8waves(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    block_table: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Return the first 32x32 unscaled QK tile from the experimental 32x32 8-wave QK path.
+    This is a bring-up/debug API and currently requires page_block_size == 32 and
+    q.shape[1] * (q.shape[2] // k_cache.shape[2]) == 32.
+    """
+    return flash_mla.debug_qk_32x32_8waves(q, k_cache, cache_seqlens, block_table)
+
+
+def debug_qk_softmax_32x32_8waves(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    block_table: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Return softmax(QK * softmax_scale) from the experimental 32x32 8-wave QK path.
+    This is a bring-up/debug API and currently requires page_block_size == 32 and
+    q.shape[1] * (q.shape[2] // k_cache.shape[2]) == 32.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    return flash_mla.debug_qk_softmax_32x32_8waves(q, k_cache, cache_seqlens, block_table, softmax_scale)

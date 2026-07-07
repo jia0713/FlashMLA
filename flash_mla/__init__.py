@@ -4,5 +4,7 @@ __version__ = "1.0.1"
 from flash_mla.flash_mla_interface import(
     get_mla_metadata,
     flash_mla_with_kvcache,
-    flash_mla_sparse_fwd
+    flash_mla_sparse_fwd,
+    debug_qk_32x32_8waves,
+    debug_qk_softmax_32x32_8waves
 )
